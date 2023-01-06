@@ -189,7 +189,6 @@ use Digest::MD5 qw(md5_hex);
 use boolean;
 use Excel::Writer::XLSX;
 use Template;
-use Data::Dumper;
 use Devel::Size qw(size total_size);
 use Data::DeepAccess qw(deep_get);
 use Log::Log4perl;
@@ -399,6 +398,11 @@ sub process_template ($template_filename, $template_data_ref, $result_content_re
 	$template_data_ref->{product_action_url} = \&product_action_url;
 	$template_data_ref->{product_name_brand_quantity} = \&product_name_brand_quantity;
 
+	# select2 options generator for all entries in a taxonomy
+	$template_data_ref->{generate_select2_options_for_taxonomy_to_json} = sub ($tagtype) {
+		return generate_select2_options_for_taxonomy_to_json($lc, $tagtype);
+	};
+
 	# Return a link to one taxonomy entry in the target language
 	$template_data_ref->{canonicalize_taxonomy_tag_link} = sub ($tagtype, $tag) {
 		return canonicalize_taxonomy_tag_link($lc, $tagtype, $tag);
@@ -514,7 +518,7 @@ A scalar value for the parameter, or undef if the parameter is not defined.
 =cut
 
 sub request_param ($request_ref, $param_name) {
-	return (scalar param($param_name)) || deep_get($request_ref, "request_body_json", $param_name);
+	return (scalar param($param_name)) || deep_get($request_ref, "body_json", $param_name);
 }
 
 =head2 init_request ()
@@ -527,24 +531,34 @@ $lc : language code
 
 It also initializes a request object that is returned.
 
+=head3 Parameters
+
+=head4 (optional) Request object reference $request_ref
+
+This function may be passed an existing request object reference
+(e.g. pre-containing some fields of the request, like a JSON body).
+
+If not passed, a new request object will be created.
+
+
 =head3 Return value
 
 Reference to request object.
 
 =cut
 
-sub init_request() {
+sub init_request ($request_ref = {}) {
+
+	$log->debug("init_request - start", {request_ref => $request_ref}) if $log->is_debug();
 
 	# Clear the context
 	delete $log->context->{user_id};
 	delete $log->context->{user_session};
 	$log->context->{request} = generate_token(16);
 
-	# Create and initialize a request object
-	my $request_ref = {
-		'original_query_string' => $ENV{QUERY_STRING},
-		'referer' => referer()
-	};
+	# Initialize the request object
+	$request_ref->{referer} = referer();
+	$request_ref->{original_query_string} = $ENV{QUERY_STRING};
 
 	# Depending on web server configuration, we may get or not get a / at the start of the QUERY_STRING environment variable
 	# remove the / to normalize the query string, as we use it to build some redirect urls
@@ -741,13 +755,36 @@ sub init_request() {
 
 	my $error = ProductOpener::Users::init_user($request_ref);
 	if ($error) {
-		# TODO: currently we always display an HTML message if we were passed a bad user_id and password combination
-		# even if the request is an API request
+		# We were sent bad user_id / password credentials
 
+		# If it is an API v3 query, the error will be handled by API::process_api_request()
+		if ((defined $request_ref->{api_version}) and ($request_ref->{api_version} >= 3)) {
+			$log->debug(
+				"init_request - init_user error - API v3: continue",
+				{init_user_error => $request_ref->{init_user_error}}
+			) if $log->is_debug();
+			add_error(
+				$request_ref->{api_response},
+				{
+					message => {id => "invalid_user_id_and_password"},
+					impact => {id => "failure"},
+				}
+			);
+		}
+		# /cgi/auth.pl returns a JSON body
 		# for requests to /cgi/auth.pl, we will now return a JSON body, set in /cgi/auth.pl
-		# but it would be good to later have a more consistent behaviour for all API requests
-		if ($r->uri() !~ /\/cgi\/auth\.pl/) {
-			print $r->uri();
+		elsif ($r->uri() =~ /\/cgi\/auth\.pl/) {
+			$log->debug(
+				"init_request - init_user error - /cgi/auth.pl: continue",
+				{init_user_error => $request_ref->{init_user_error}}
+			) if $log->is_debug();
+		}
+		# Otherwise we return an error page in HTML (including for v0 / v1 / v2 API queries)
+		else {
+			$log->debug(
+				"init_request - init_user error - display error page",
+				{init_user_error => $request_ref->{init_user_error}}
+			) if $log->is_debug();
 			display_error_and_exit($error, 403);
 		}
 	}
@@ -1679,7 +1716,7 @@ sub display_list_of_tags ($request_ref, $query_ref) {
 		if ((defined $request_ref->{tag_prefix}) and ($request_ref->{tag_prefix} ne '')) {
 			my $prefix = $request_ref->{tag_prefix};
 			$main_link = add_tag_prefix_to_link($main_link, $prefix);
-			$log->debug("Found tag prefix for main_link " . Dumper($request_ref)) if $log->is_debug();
+			$log->debug("Found tag prefix for main_link", {request => $request_ref}) if $log->is_debug();
 		}
 
 		my %products = ();    # number of products by tag, used for histogram of nutrition grades colors
@@ -2355,8 +2392,6 @@ sub display_list_of_tags_translate ($request_ref, $query_ref) {
 
 		load_users_translations_for_lc($users_translations_ref, $tagtype, $lc);
 
-		print STDERR Dumper($users_translations_ref);
-
 		my %products = ();    # number of products by tag, used for histogram of nutrition grades colors
 
 		$log->debug("going through all tags") if $log->is_debug();
@@ -2976,7 +3011,7 @@ sub display_tag ($request_ref) {
 			my $prefix = $request_ref->{tag_prefix};
 			$request_ref->{current_link} = add_tag_prefix_to_link($request_ref->{current_link}, $prefix);
 			$request_ref->{world_current_link} = add_tag_prefix_to_link($request_ref->{world_current_link}, $prefix);
-			$log->debug("Found tag prefix " . Dumper($request_ref)) if $log->is_debug();
+			$log->debug("Found tag prefix ", {request => $request_ref}) if $log->is_debug();
 		}
 
 		$request_ref->{canon_tagid} = $canon_tagid;
@@ -3045,7 +3080,7 @@ sub display_tag ($request_ref) {
 			my $prefix = $request_ref->{tag2_prefix};
 			$request_ref->{current_link} = add_tag_prefix_to_link($request_ref->{current_link}, $prefix);
 			$request_ref->{world_current_link} = add_tag_prefix_to_link($request_ref->{world_current_link}, $prefix);
-			$log->debug("Found tag prefix 2 " . Dumper($request_ref)) if $log->is_debug();
+			$log->debug("Found tag prefix 2 ", {request => $request_ref}) if $log->is_debug();
 		}
 
 		$request_ref->{canon_tagid2} = $canon_tagid2;
@@ -4339,7 +4374,8 @@ sub add_country_and_owner_filters_to_query ($request_ref, $query_ref) {
 		}
 	}
 
-	$log->debug("request_ref: " . Dumper($request_ref) . "query_ref: " . Dumper($query_ref)) if $log->is_debug();
+	$log->debug("result of add_country_and_owner_filters_to_query", {request => $request_ref, query => $query_ref})
+		if $log->is_debug();
 
 	return;
 }
@@ -4867,7 +4903,7 @@ sub search_and_display_products ($request_ref, $query_ref, $sort_by, $limit, $pa
 
 		$request_ref->{structured_response} = {
 			page => $page,
-			page_size => $limit,
+			page_size => 0 + $limit,
 			skip => $skip,
 			products => [],
 		};
@@ -6673,7 +6709,6 @@ sub display_bottom_block ($blocks_ref) {
 
 sub display_page ($request_ref) {
 
-	#$log->trace("Start of display_page " . Dumper($request_ref)) if $log->is_trace();
 	$log->trace("Start of display_page") if $log->is_trace();
 
 	my $template_data_ref = {};
@@ -6936,36 +6971,9 @@ sub display_page ($request_ref) {
 	$template_data_ref->{link} = $link;
 	$template_data_ref->{lc} = $lc;
 
-	if (
-		not($server_options{producers_platform})
-		and (  (not(defined cookie('hide_image_banner_2022')))
-			or (not(cookie('hide_image_banner_2022') eq '1')))
-		)
-	{
-		$template_data_ref->{banner} = $banner;
-
-		$initjs .= <<'JS';
-if ($.cookie('hide_image_banner_2022') == '1') {
-	$('.hide_image_banner').prop('checked', true);
-	$('#donate_banner_top').remove();
-}
-else {
-	$('.hide_image_banner').prop('checked', false);
-	$('#donate_banner_top').show();
-	$('.hide_image_banner').change(function () {
-		if (($('#hide_image_banner1').prop('checked')) || ($('#hide_image_banner2').prop('checked'))) {
-			$.cookie('hide_image_banner_2022', '1', { expires: 90, path: '/' });
-			$('#donate_banner_top').remove();
-		}
-	});
-}
-JS
-	}
-
 	my $tagline = lang("tagline");
 
 	if ($server_options{producers_platform}) {
-
 		$tagline = "";
 	}
 
@@ -10283,8 +10291,6 @@ sub display_structured_response ($request_ref) {
 		}
 	) if $log->is_debug();
 
-	$log->debug("display_structured_response", {request => $request_ref}) if $log->is_debug();
-
 	if (single_param("xml")) {
 
 		# my $xs = XML::Simple->new(NoAttr => 1, NumericEscape => 2);
@@ -11233,6 +11239,56 @@ sub data_to_display_image ($product_ref, $imagetype, $target_lc) {
 	}
 
 	return $image_ref;
+}
+
+=head2 generate_select2_options_for_taxonomy ($target_lc, $tagtype)
+
+Generates an array of taxonomy entries in a specific language, to be used as options
+in a select2 input.
+
+See https://select2.org/data-sources/arrays
+
+=head3 Arguments
+
+=head4 Language code $target_lc
+
+=head4 Taxonomy $tagtype
+
+=head3 Return values
+
+- Reference to an array of options
+
+=cut
+
+sub generate_select2_options_for_taxonomy ($target_lc, $tagtype) {
+
+	my @entries = ();
+
+	# all tags can be retrieved from the $translations_to hash
+	foreach my $canon_tagid (keys %{$translations_to{$tagtype}}) {
+		# just_synonyms are not real entries
+		next if defined $just_synonyms{$tagtype}{$canon_tagid};
+
+		push @entries, display_taxonomy_tag($target_lc, $tagtype, $canon_tagid);
+	}
+
+	my @options = ();
+
+	foreach my $entry (sort @entries) {
+		push @options,
+			{
+			id => $entry,
+			text => $entry,
+			};
+	}
+
+	return \@options;
+}
+
+sub generate_select2_options_for_taxonomy_to_json ($target_lc, $tagtype) {
+
+	return decode_utf8(
+		JSON::PP->new->utf8->canonical->encode(generate_select2_options_for_taxonomy($target_lc, $tagtype)));
 }
 
 1;

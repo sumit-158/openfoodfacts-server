@@ -43,6 +43,7 @@ use Log::Any qw($log);
 BEGIN {
 	use vars qw(@ISA @EXPORT_OK %EXPORT_TAGS);
 	@EXPORT_OK = qw(
+		&init_api_response
 		&get_initialized_response
 		&add_warning
 		&add_error
@@ -78,6 +79,7 @@ use Apache2::RequestIO();
 use Apache2::RequestRec();
 use JSON::PP;
 use Data::DeepAccess qw(deep_get);
+use Storable qw(dclone);
 
 sub get_initialized_response() {
 	return {
@@ -89,6 +91,8 @@ sub get_initialized_response() {
 sub init_api_response ($request_ref) {
 
 	$request_ref->{api_response} = get_initialized_response();
+
+	$log->debug("init_api_response - done", {request => $request_ref}) if $log->is_debug();
 	return $request_ref->{api_response};
 }
 
@@ -169,7 +173,7 @@ sub decode_json_request_body ($request_ref) {
 		);
 	}
 	else {
-		eval {$request_ref->{request_body_json} = decode_json($request_ref->{body});};
+		eval {$request_ref->{body_json} = decode_json($request_ref->{body});};
 		if ($@) {
 			$log->error("JSON decoding error", {error => $@}) if $log->is_error();
 			add_error(
@@ -339,40 +343,48 @@ sub process_api_request ($request_ref) {
 
 	$log->debug("process_api_request - start", {request => $request_ref}) if $log->is_debug();
 
-	my $response_ref = init_api_response($request_ref);
+	my $response_ref = $request_ref->{api_response};
 
-	# Analyze the request body
+	# Check if we already have errors (e.g. authentification error, invalid JSON body)
+	if ((scalar @{$response_ref->{errors}}) > 0) {
+		$log->warn("process_api_request - we already have errors, skipping processing", {request => $request_ref})
+			if $log->is_warn();
+	}
+	else {
 
-	if ($request_ref->{api_action} eq "product") {
+		# Route the API request to the right processing function, based on API action (from path) and method
 
-		if ($request_ref->{api_method} eq "PATCH") {
-			write_product_api($request_ref);
-		}
-		elsif ($request_ref->{api_method} =~ /^(GET|HEAD|OPTIONS)$/) {
-			read_product_api($request_ref);
+		if ($request_ref->{api_action} eq "product") {
+
+			if ($request_ref->{api_method} eq "PATCH") {
+				write_product_api($request_ref);
+			}
+			elsif ($request_ref->{api_method} =~ /^(GET|HEAD|OPTIONS)$/) {
+				read_product_api($request_ref);
+			}
+			else {
+				$log->warn("process_api_request - invalid method", {request => $request_ref}) if $log->is_warn();
+				add_error(
+					$response_ref,
+					{
+						message => {id => "invalid_api_method"},
+						field => {id => "api_method", value => $request_ref->{api_method}},
+						impact => {id => "failure"},
+					}
+				);
+			}
 		}
 		else {
-			$log->warn("process_api_request - invalid method", {request => $request_ref}) if $log->is_warn();
+			$log->warn("process_api_request - unknown action", {request => $request_ref}) if $log->is_warn();
 			add_error(
 				$response_ref,
 				{
-					message => {id => "invalid_api_method"},
-					field => {id => "api_method", value => $request_ref->{api_method}},
+					message => {id => "invalid_api_action"},
+					field => {id => "api_action", value => $request_ref->{api_action}},
 					impact => {id => "failure"},
 				}
 			);
 		}
-	}
-	else {
-		$log->warn("process_api_request - unknown action", {request => $request_ref}) if $log->is_warn();
-		add_error(
-			$response_ref,
-			{
-				message => {id => "invalid_api_action"},
-				field => {id => "api_action", value => $request_ref->{api_action}},
-				impact => {id => "failure"},
-			}
-		);
 	}
 
 	determine_response_result($response_ref);
@@ -506,29 +518,40 @@ Reference to the customized product object.
 
 sub customize_packagings ($request_ref, $product_ref) {
 
+	my $customized_packagings_ref = $product_ref->{packagings};
+
 	if (defined $product_ref->{packagings}) {
 
 		my $tags_lc = request_param($request_ref, 'tags_lc');
 
+		# We need to make a copy of $product_ref->{packagings}, it cannot be updated directly
+		# as the internal format of "packagings" is used in other functions
+		# (e.g. to generate knowledge panels)
+
+		$customized_packagings_ref = [];
+
 		foreach my $packaging_ref (@{$product_ref->{packagings}}) {
+
+			my $customized_packaging_ref = dclone($packaging_ref);
 
 			if ($request_ref->{api_version} >= 3) {
 				# Shape, material and recycling are localized
 				foreach my $property ("shape", "material", "recycling") {
 					if (defined $packaging_ref->{$property}) {
 						my $property_value_id = $packaging_ref->{$property};
-						$packaging_ref->{$property} = {"id" => $property_value_id};
+						$customized_packaging_ref->{$property} = {"id" => $property_value_id};
 						if (defined $tags_lc) {
-							$packaging_ref->{$property}{lc_name}
+							$customized_packaging_ref->{$property}{lc_name}
 								= display_taxonomy_tag($tags_lc, $packaging_taxonomies{$property}, $property_value_id);
 						}
 					}
 				}
 			}
+			push @$customized_packagings_ref, $customized_packaging_ref;
 		}
 	}
 
-	return $product_ref->{packagings};
+	return $customized_packagings_ref;
 }
 
 =head2 customize_response_for_product ( $request_ref, $product_ref, $fields )
@@ -574,14 +597,21 @@ sub customize_response_for_product ($request_ref, $product_ref, $fields) {
 	if ((not defined $fields) or ($fields eq "none")) {
 		return {};
 	}
-	elsif ($fields eq "all") {
+	elsif ($fields eq "raw") {
+		# Return the raw product data, as stored in the .sto files and database
 		return $product_ref;
 	}
 
+	if ($fields =~ /\ball\b/) {
+		# Return all fields of the product, with processing that depends on the API version used
+		# e.g. in API v3, the "packagings" structure is more verbose than the stored version
+		$fields = $` . join(",", sort keys %{$product_ref}) . $';
+	}
+
 	# Callers of the API V3 WRITE product can send fields = updated to get only updated fields
-	if ($fields eq "updated") {
+	if ($fields =~ /\bupdated\b/) {
 		if (defined $request_ref->{updated_product_fields}) {
-			$fields = join(',', sort keys %{$request_ref->{updated_product_fields}});
+			$fields = $` . join(',', sort keys %{$request_ref->{updated_product_fields}}) . $';
 			$log->debug("returning only updated fields", {fields => $fields}) if $log->is_debug();
 		}
 	}
